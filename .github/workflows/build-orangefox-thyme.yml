@@ -1,0 +1,191 @@
+name: Build OrangeFox for Xiaomi 10S (thyme)
+
+on:
+  workflow_dispatch:
+    inputs:
+      fox_branch:
+        description: OrangeFox branch
+        required: true
+        default: fox_12.1
+        type: string
+      device_tree_repo:
+        description: Git repository containing the OrangeFox/TWRP device tree
+        required: true
+        default: https://github.com/YOUR_NAME/device_xiaomi_thyme.git
+        type: string
+      device_tree_branch:
+        description: Device-tree branch
+        required: true
+        default: fox_12.1
+        type: string
+      lunch_target:
+        description: Lunch target exported by the device tree
+        required: true
+        default: twrp_thyme-eng
+        type: string
+      build_target:
+        description: recoveryimage or bootimage, according to the device tree
+        required: true
+        default: recoveryimage
+        type: choice
+        options:
+          - recoveryimage
+          - bootimage
+      enable_wifi_overlay:
+        description: Apply repository Wi-Fi overlay before building
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  LANG: C.UTF-8
+  LC_ALL: C.UTF-8
+  TZ: Asia/Shanghai
+  USE_CCACHE: "1"
+  CCACHE_EXEC: /usr/bin/ccache
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  FOX_BUILD_DEVICE: thyme
+  ALLOW_MISSING_DEPENDENCIES: "true"
+
+jobs:
+  build:
+    # Recommended: Ubuntu 22.04 self-hosted runner, 16+ GB RAM, 160+ GB free SSD.
+    runs-on: [self-hosted, linux, x64, orangefox]
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout orchestration repository
+        uses: actions/checkout@v4
+
+      - name: Validate inputs
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          [[ "${{ inputs.device_tree_repo }}" == https://github.com/* ]] || {
+            echo "Only public GitHub HTTPS device-tree repositories are accepted." >&2
+            exit 2
+          }
+          [[ "${{ inputs.lunch_target }}" =~ ^[A-Za-z0-9._-]+$ ]] || exit 2
+          df -h .
+          free -h
+          free_kb=$(df -Pk . | awk 'NR==2 {print $4}')
+          if (( free_kb < 125829120 )); then
+            echo "At least 120 GiB free space is required; 160 GiB is recommended." >&2
+            exit 3
+          fi
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            bc bison build-essential ccache curl flex g++-multilib gcc-multilib \
+            git git-lfs gnupg gperf imagemagick lib32ncurses5-dev lib32readline-dev \
+            lib32z1-dev libelf-dev liblz4-tool libncurses5-dev libsdl1.2-dev \
+            libssl-dev libxml2 libxml2-utils lzop openjdk-11-jdk pngcrush \
+            rsync schedtool squashfs-tools xsltproc zip zlib1g-dev python3
+          mkdir -p "$HOME/bin"
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o "$HOME/bin/repo"
+          chmod 0755 "$HOME/bin/repo"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Configure ccache
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$CCACHE_DIR"
+          ccache -M 30G
+          ccache -z
+
+      - name: Sync OrangeFox source
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p fox
+          cd fox
+          repo init --depth=1 \
+            -u https://gitlab.com/OrangeFox/Manifest.git \
+            -b "${{ inputs.fox_branch }}"
+          repo sync -c --force-sync --no-clone-bundle --no-tags -j"$(nproc)"
+
+      - name: Add thyme device tree
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          rm -rf fox/device/xiaomi/thyme
+          git clone --depth=1 --branch "${{ inputs.device_tree_branch }}" \
+            "${{ inputs.device_tree_repo }}" fox/device/xiaomi/thyme
+          test -f fox/device/xiaomi/thyme/AndroidProducts.mk
+
+      - name: Apply optional Wi-Fi overlay
+        if: ${{ inputs.enable_wifi_overlay }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          bash scripts/apply-wifi-overlay.sh \
+            fox/device/xiaomi/thyme \
+            "$GITHUB_WORKSPACE/wifi-overlay"
+
+      - name: Record source revisions
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p logs
+          (cd fox && repo manifest -r) > logs/pinned-manifest.xml
+          git -C fox/device/xiaomi/thyme rev-parse HEAD > logs/device-tree-commit.txt
+          {
+            echo "fox_branch=${{ inputs.fox_branch }}"
+            echo "device_tree_repo=${{ inputs.device_tree_repo }}"
+            echo "device_tree_branch=${{ inputs.device_tree_branch }}"
+            echo "lunch_target=${{ inputs.lunch_target }}"
+            echo "build_target=${{ inputs.build_target }}"
+          } > logs/build-inputs.txt
+
+      - name: Build
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          exec > >(tee "$GITHUB_WORKSPACE/logs/build.log") 2>&1
+          cd fox
+          source build/envsetup.sh
+          export FOX_BUILD_DEVICE=thyme
+          export OF_MAINTAINER="${GITHUB_REPOSITORY_OWNER}"
+          lunch "${{ inputs.lunch_target }}"
+          mka "${{ inputs.build_target }}" -j"$(nproc)"
+
+      - name: Collect and verify artifacts
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p artifacts
+          find fox/out/target/product/thyme -maxdepth 2 -type f \
+            \( -name 'recovery.img' -o -name 'boot.img' -o -name 'OrangeFox*.zip' \) \
+            -exec cp -v {} artifacts/ \; 2>/dev/null || true
+          if compgen -G 'artifacts/*' >/dev/null; then
+            (cd artifacts && sha256sum * > SHA256SUMS.txt)
+          fi
+          ccache -s > logs/ccache-stats.txt || true
+          df -h > logs/disk-final.txt
+
+      - name: Upload recovery artifacts
+        if: ${{ success() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: orangefox-thyme-${{ github.run_number }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload build logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: orangefox-thyme-logs-${{ github.run_number }}
+          path: logs/
+          if-no-files-found: warn
+          retention-days: 30

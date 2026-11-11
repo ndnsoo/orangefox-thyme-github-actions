@@ -1,0 +1,6 @@
+fox/
+.ccache/
+artifacts/
+logs/
+*.img
+*.zip
